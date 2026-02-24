@@ -1,0 +1,85 @@
+# CellAtria 2.0 — Full Project Status & Issue Summary
+
+## What Is CellAtria 2.0?
+An autonomous scRNA-seq drug repurposing pipeline built with **Streamlit + LangGraph + Groq (Llama-3.3-70B) + E2B sandbox**. The user uploads a research paper PDF, and 4 AI agents work in sequence:
+
+```
+PDF → Literature Agent → Ingestion Agent → Bioinformatician Agent → Strategist Agent → Drug Candidates
+```
+
+| Agent | Role | Current Status |
+|-------|------|----------------|
+| **Literature Agent** | Extracts GEO accession IDs from PDF (regex + LLM NER) | ✅ Works — finds accessions |
+| **Ingestion Agent** | Downloads raw scRNA-seq data from NCBI GEO/FTP | ❌ Downloads timeout (NCBI FTP is slow) |
+| **Bioinformatician** | Runs QC pipeline in E2B sandbox | ❌ E2B sandbox constructor fails + no data from ingestion |
+| **Strategist** | Runs drug repurposing in E2B sandbox | ❌ E2B sandbox constructor fails + no data upstream |
+
+## The Core Issue (Still Persisting)
+
+**The pipeline times out at 180 seconds and the right panel shows "No drug candidates".**
+
+### Root Cause Chain:
+
+1. **Groq API Rate Limits** — The free-tier Groq API aggressively rate-limits. Each LLM call can trigger 4 retries with exponential backoff (4s→8s→16s→32s = 60s per call). The Literature Agent alone can consume 60s just on rate-limited retries.
+
+2. **NCBI FTP Downloads Hang** — GEOparse fails, raw FTP fallback is slow/times out. Even with a 15s per-accession timeout, the ingestion phase takes 30s+ (2 accessions × 15s).
+
+3. **E2B Sandbox Constructor Error** — The `Sandbox(template=...)` constructor throws `TypeError: SandboxBase.__init__() got an unexpected keyword argument 'template'`. The e2b_code_interpreter SDK version may not match the API being used.
+
+4. **Pipeline Budget Exceeded** — Combined: Literature (60s rate limit) + Ingestion (30s timeouts) + Bioinformatician fallback LLM (60s rate limit) + Strategist fallback LLM (60s rate limit) = **210s > 180s global timeout**. The LLM fallback agents never finish in time.
+
+## Steps Already Taken
+
+### Session 1: Background Checks & Rate Limit Safeguards
+- ✅ Created [core/status_logger.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/status_logger.py) — thread-safe singleton for status events
+- ✅ Created [core/llm_utils.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/llm_utils.py) — centralized [call_llm()](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/llm_utils.py#60-147) with exponential backoff (4 retries)
+- ✅ Wired all 3 LLM-using agents to use [call_llm()](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/llm_utils.py#60-147) instead of raw `ChatGroq`
+- ✅ Added [check_e2b_health()](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/e2b_manager.py#35-57) to [core/e2b_manager.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/e2b_manager.py)
+- ✅ Built "Background Checks" UI panel in sidebar (GROQ/E2B/FTP/PIPE status dots + event log)
+
+### Session 2: Fixing UI State Transitions
+- ✅ Fixed hot-reload bug: moved `_PIPELINE_RESULT` from module-level dict to `st.session_state` via [_get_result_dict()](file:///C:/Users/samee/OneDrive/Desktop/CellAtria%202.0/app.py#612-631) — survives Streamlit file-change reimports
+- ✅ Fixed `ThreadPoolExecutor` deadlock: `with` context manager's `__exit__` calls `shutdown(wait=True)`, blocking forever when inner thread hangs. Changed to manual `shutdown(wait=False, cancel_futures=True)`
+- ✅ Added real-time pipeline progress events to all 4 agents (📚📥🧬💊 emoji markers in PIPE status)
+- ✅ UI now transitions from "running" → "complete" phase correctly
+
+### Session 3: Timeout & Fallback Safeguards
+- ✅ Added 180s global pipeline timeout using `concurrent.futures`
+- ✅ Added 15s per-accession download timeout in ingestion agent
+- ✅ Capped accession processing to max 2
+- ✅ Added LLM fallback in Bioinformatician: generates QC metrics via LLM when data is missing
+- ✅ Added LLM fallback in Strategist: generates drug candidates via LLM when E2B fails
+- ❌ **Still timing out** — the combined rate-limited LLM calls exceed the 180s budget
+
+## What's Still Broken
+
+The fundamental problem is **Groq free-tier rate limits**. Each LLM call can take up to 60s due to 4 retries with exponential backoff when rate-limited. The pipeline needs ~4 LLM calls total, and if most hit rate limits, the total exceeds the 180s timeout.
+
+### Possible Fixes (Not Yet Attempted)
+
+1. **Increase global timeout to 300-360s** — Simple, but user waits longer
+2. **Reduce retry count from 4 to 2** — Faster failure, but less resilient
+3. **Use a paid Groq tier** — No rate limits, calls return in 1-2s each
+4. **Cache LLM results** — Skip redundant calls for the same paper
+5. **Fix E2B SDK constructor** — Use `Sandbox(api_key=...)` without `template` param, or pin correct SDK version
+6. **Pre-generate results for demo** — Hardcode realistic results that display immediately, bypassing all API calls
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| [app.py](file:///C:/Users/samee/OneDrive/Desktop/CellAtria%202.0/app.py) | Streamlit UI, pipeline orchestration, Background Checks panel |
+| [core/graph.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/graph.py) | LangGraph assembly — 4 nodes with conditional routing |
+| [core/llm_utils.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/llm_utils.py) | [call_llm()](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/llm_utils.py#60-147) with rate-limit backoff |
+| [core/status_logger.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/status_logger.py) | Thread-safe status event logger |
+| [core/e2b_manager.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/core/e2b_manager.py) | E2B sandbox execution + health check |
+| [agents/literature_agent.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/agents/literature_agent.py) | PDF → GEO accession extraction |
+| [agents/ingestion_agent.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/agents/ingestion_agent.py) | GEO data download + 10X detection |
+| [agents/bioinformatician_agent.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/agents/bioinformatician_agent.py) | QC pipeline generation + E2B execution |
+| [agents/subpopulation_strategist.py](file:///c:/Users/samee/OneDrive/Desktop/CellAtria%202.0/agents/subpopulation_strategist.py) | Drug repurposing + E2B execution |
+
+## Environment
+- Python 3.12, Streamlit, LangGraph, langchain_groq
+- Groq API (free tier) with Llama-3.3-70B
+- E2B Code Interpreter SDK (installed but constructor incompatible)
+- Windows 11, running locally
